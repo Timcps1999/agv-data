@@ -209,29 +209,28 @@
         const coordDisplay = document.getElementById('coord-display');
 
         let isRecording = false;
-        let samplingTimer = null;
+        let lastLogTime = 0;
+        let lastFrameTime = 0;
         let lastFrameData = null;
         let logs = [];
-        let smoothingBuffer = [];
 
         // Coords Tracking
         let curX = 0, curY = 0, velX = 0, velY = 0;
         let lastMotionTime = Date.now();
+        let sensorActive = false;
 
         // Config
         const ROI_RECT = { x: 0.2, y: 0.3, w: 0.6, h: 0.3 };
         const PIXEL_DIFF_THRESHOLD = 35;
         const CHANGE_RATIO_THRESHOLD = 0.30;
-        const SMOOTHING_SIZE = 5;
-        const ACCEL_DEADZONE = 0.15;
-        const VELOCITY_DAMPING = 0.96;
+        const ACCEL_DEADZONE = 0.10; // Slightly lower for better sensitivity
+        const VELOCITY_DAMPING = 0.97; // Keep momentum a bit longer
 
         let lastAvgGray = -1;
         let isLoadedState = false;
+        let currentStdDev = 0;
 
-        // Thresholds for Texture Detection (Environment-based)
-        // High SD = Seeing complex factory (EMPTY)
-        // Low SD = Blocked by smooth/close-up box (LOADED)
+        // Thresholds for Texture Detection
         const SD_EMPTY_THRESHOLD = 18;
         const SD_LOADED_THRESHOLD = 10;
 
@@ -243,25 +242,39 @@
                     audio: false
                 });
                 video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    requestAnimationFrame(mainLoop);
+                };
             } catch (err) {
                 alert("Cannot access camera: " + err.message);
+                console.error(err);
             }
         }
 
         // Motion Tracking (Needs user gesture for iOS 13+)
         function initMotion() {
-            if (typeof DeviceMotionEvent.requestPermission === 'function') {
+            if (sensorActive) return;
+
+            const handleMotionWrapper = (e) => {
+                handleMotion(e);
+                sensorActive = true;
+            };
+
+            if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
                 DeviceMotionEvent.requestPermission()
                     .then(permissionState => {
                         if (permissionState === 'granted') {
-                            window.addEventListener('devicemotion', handleMotion);
+                            window.addEventListener('devicemotion', handleMotionWrapper);
                         } else {
-                            alert("Sensor Permission Denied. X/Y tracking will not work.");
+                            alert("Sensor Permission Denied.");
                         }
                     })
-                    .catch(console.error);
+                    .catch(e => {
+                        console.error("Motion Permission Error:", e);
+                    });
             } else {
-                window.addEventListener('devicemotion', handleMotion);
+                window.addEventListener('devicemotion', handleMotionWrapper);
             }
         }
 
@@ -270,10 +283,16 @@
             const dt = (now - lastMotionTime) / 1000;
             lastMotionTime = now;
 
-            const accel = event.acceleration;
+            // Prefer linear acceleration (exclude gravity)
+            let accel = event.acceleration;
+            
+            // Fallback to accelerationIncludingGravity if linear is not available
+            // Note: This will drift heavily if the device is not flat, but at least shows movement
             if (!accel || accel.x === null) {
-                sensorStatus.innerText = "NO DATA";
-                sensorStatus.style.color = "var(--danger)";
+                accel = event.accelerationIncludingGravity;
+            }
+
+            if (!accel || accel.x === null) {
                 return;
             }
 
@@ -281,32 +300,37 @@
             sensorStatus.innerText = "ACTIVE";
             sensorStatus.style.color = "var(--primary)";
 
-            // Swap X/Y axes and apply deadzone to prevent drift
-            const ax = Math.abs(accel.y) > ACCEL_DEADZONE ? accel.y : 0;
-            const ay = Math.abs(accel.x) > ACCEL_DEADZONE ? accel.x : 0;
+            // Extract values
+            let ax_raw = accel.y || 0;
+            let ay_raw = accel.x || 0;
 
-            // v = u + at (with damping to reduce drift)
+            // Apply deadzone
+            const ax = Math.abs(ax_raw) > ACCEL_DEADZONE ? ax_raw : 0;
+            const ay = Math.abs(ay_raw) > ACCEL_DEADZONE ? ay_raw : 0;
+
+            // Simple integration: v = u + at
             velX = (velX + ax * dt) * VELOCITY_DAMPING;
             velY = (velY + ay * dt) * VELOCITY_DAMPING;
 
-            // s = s0 + vt
+            // Position: s = s0 + vt
             curX += velX * dt;
             curY += velY * dt;
 
-            // If velocity is tiny, lock to zero
-            if (Math.abs(velX) < 0.01) velX = 0;
-            if (Math.abs(velY) < 0.01) velY = 0;
+            // Lock jittery velocity to zero
+            if (Math.abs(velX) < 0.005) velX = 0;
+            if (Math.abs(velY) < 0.005) velY = 0;
         }
 
         // Processing Logic
         function processFrame() {
-            if (!video.videoWidth) return;
+            if (!video.videoWidth || video.paused) return;
 
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+            if (canvas.width !== video.videoWidth) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            }
             ctx.drawImage(video, 0, 0);
 
-            // Extract ROI
             const x = ROI_RECT.x * canvas.width;
             const y = ROI_RECT.y * canvas.height;
             const w = ROI_RECT.w * canvas.width;
@@ -314,94 +338,97 @@
 
             const imageData = ctx.getImageData(x, y, w, h);
             const pixels = imageData.data;
-            const grayPixels = new Uint8Array(w * h);
 
-            // Convert to grayscale and Calc Mean/Variance
             let totalGray = 0;
             let totalGraySq = 0;
+            const pixelCount = w * h;
+            const grayPixels = new Uint8Array(pixelCount);
+
             for (let i = 0; i < pixels.length; i += 4) {
                 const g = pixels[i] * 0.3 + pixels[i + 1] * 0.59 + pixels[i + 2] * 0.11;
                 grayPixels[i / 4] = g;
                 totalGray += g;
                 totalGraySq += g * g;
             }
-            const pixelCount = w * h;
+
             const currentAvgGray = totalGray / pixelCount;
-            // Variance = E[X^2] - (E[X])^2
             const variance = (totalGraySq / pixelCount) - (currentAvgGray * currentAvgGray);
-            const stdDev = Math.sqrt(Math.max(0, variance));
+            currentStdDev = Math.sqrt(Math.max(0, variance));
 
-            if (lastFrameData) {
-                let diffCount = 0;
-                for (let i = 0; i < grayPixels.length; i++) {
-                    if (Math.abs(grayPixels[i] - lastFrameData[i]) > PIXEL_DIFF_THRESHOLD) {
-                        diffCount++;
-                    }
+            // State Logic
+            if (currentStdDev < SD_LOADED_THRESHOLD) {
+                isLoadedState = true;
+            } else if (currentStdDev > SD_EMPTY_THRESHOLD) {
+                isLoadedState = false;
+            }
+
+            // Jump Detection
+            if (lastAvgGray !== -1) {
+                const jump = Math.abs(currentAvgGray - lastAvgGray);
+                if (jump > (255 * CHANGE_RATIO_THRESHOLD)) {
+                    isLoadedState = !isLoadedState;
                 }
+            }
 
-                const ratio = diffCount / (w * h);
+            // Update Prediction UI
+            const statusText = isLoadedState ? 'LOADED' : 'EMPTY';
+            detectionResult.innerText = statusText;
+            detectionResult.style.color = isLoadedState ? 'var(--primary)' : '#ffcc00';
 
-                // Environment-based Detection Logic (SD)
-                // Low SD = Blocked by object (LOADED)
-                // High SD = Complex background visible (EMPTY)
-                if (stdDev < SD_LOADED_THRESHOLD) {
-                    isLoadedState = true;
-                } else if (stdDev > SD_EMPTY_THRESHOLD) {
-                    isLoadedState = false;
-                }
-
-                // Keep Jump detection as an override toggle
-                const isJumpDetected = (lastAvgGray !== -1) && (Math.abs(currentAvgGray - lastAvgGray) > (255 * CHANGE_RATIO_THRESHOLD));
-                if (isJumpDetected) isLoadedState = !isLoadedState;
-
-                // Update UI
-                const statusText = isLoadedState ? 'LOADED' : 'EMPTY';
-                detectionResult.innerText = statusText;
-                detectionResult.style.color = isLoadedState ? 'var(--primary)' : '#ffcc00';
-
-                coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${stdDev.toFixed(1)}`;
-
-                // Log
-                if (isRecording) {
+            // Logging
+            if (isRecording) {
+                const now = Date.now();
+                const interval = parseInt(document.getElementById('interval-select').value);
+                if (now - lastLogTime >= interval) {
                     logs.push({
                         time: new Date().toISOString(),
                         id: document.getElementById('agv-id').value,
                         status: isLoadedState ? 1 : 0,
                         avg_gray: currentAvgGray.toFixed(1),
-                        std_dev: stdDev.toFixed(1),
-                        x: curX.toFixed(2),
-                        y: curY.toFixed(2)
+                        std_dev: currentStdDev.toFixed(1),
+                        x: curX.toFixed(4),
+                        y: curY.toFixed(4)
                     });
+                    lastLogTime = now;
                 }
-
-                lastAvgGray = currentAvgGray;
             }
 
+            lastAvgGray = currentAvgGray;
             lastFrameData = grayPixels;
+        }
+
+        // Main Loop for UI and High-Freq Updates
+        function mainLoop(timestamp) {
+            // Update Coords UI at maximum frame rate
+            coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}`;
+
+            // Process detection at a fixed rate (approx 10 FPS) for visual feedback
+            if (timestamp - lastFrameTime > 100) {
+                processFrame();
+                lastFrameTime = timestamp;
+            }
+
+            requestAnimationFrame(mainLoop);
         }
 
         // Controls
         document.getElementById('btn-start').onclick = () => {
-            initMotion(); // Request sensor on first click
+            initMotion();
             isRecording = true;
+            lastLogTime = 0; // Trigger immediate first log
             recordingStatus.innerText = "RECORDING";
             recordingStatus.style.color = "var(--primary)";
-            smoothingBuffer = [];
-            const interval = parseInt(document.getElementById('interval-select').value);
-            samplingTimer = setInterval(processFrame, interval);
         };
 
         document.getElementById('btn-stop').onclick = () => {
             isRecording = false;
             recordingStatus.innerText = "STOPPED";
             recordingStatus.style.color = "#fff";
-            clearInterval(samplingTimer);
         };
 
         document.getElementById('btn-set-origin').onclick = () => {
             curX = 0; curY = 0; velX = 0; velY = 0;
-            coordDisplay.innerHTML = `X: 0.00, Y: 0.00 | SD: 0.0`;
-            alert("All coordinates and momentum reset to ZERO.");
+            alert("Coordinates Reset.");
         };
 
         document.getElementById('btn-clear').onclick = () => {
@@ -411,9 +438,9 @@
 
         document.getElementById('btn-export').onclick = () => {
             if (logs.length === 0) { alert("No data to export"); return; }
-            let csv = "timestamp_iso8601,agv_id,load_flag,confidence,change_ratio,coord_x,coord_y\n";
+            let csv = "timestamp_iso8601,agv_id,load_flag,avg_gray,std_dev,coord_x,coord_y\n";
             logs.forEach(l => {
-                csv += `${l.time},${l.id},${l.status},${l.conf},${l.ratio},${l.x},${l.y}\n`;
+                csv += `${l.time},${l.id},${l.status},${l.avg_gray},${l.std_dev},${l.x},${l.y}\n`;
             });
 
             const blob = new Blob([csv], { type: 'text/csv' });
