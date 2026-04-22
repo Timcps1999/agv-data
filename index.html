@@ -467,13 +467,12 @@
                 finalR = lax;
             }
 
-            // IMU_FIX: A) TRUE CALIBRATION (bias estimation for horizontal accel)
+            // IMU_FIX: A) TRUE CALIBRATION
             if (calibrationCount < CALIBRATION_LIMIT) {
                 calibrationCount++;
                 sensorStatus.innerText = `CALIBRATING ${Math.round(calibrationCount/CALIBRATION_LIMIT*100)}%`;
                 sensorStatus.style.color = "#ffcc00";
                 
-                // Stillness gate for calibration
                 if (rotMag < ROT_STILL && Math.abs(finalF) < CAL_ACC_GATE && Math.abs(finalR) < CAL_ACC_GATE) {
                     calSumAf += finalF;
                     calSumAr += finalR;
@@ -488,10 +487,10 @@
                         sensorStatus.style.color = "var(--primary)";
                     } else {
                         biasAf = 0; biasAr = 0;
-                        sensorStatus.innerText = "CALIB WARN"; // Bias remains 0, but show warning
+                        sensorStatus.innerText = "ACTIVE (NO_CAL)";
+                        sensorStatus.style.color = "var(--info)";
                     }
                 }
-                return;
             }
 
             // IMU_FIX: Apply Bias and C) SOFT rotation suppression
@@ -715,10 +714,9 @@
                 indicator.innerText = "DRIFT LIKELY";
             }
 
-            document.getElementById('scale-val').innerText = pxToMeter.toFixed(5);
-            coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}`;
-
             if (timestamp - lastFrameTime > 100) {
+                document.getElementById('scale-val').innerText = pxToMeter.toFixed(5);
+                coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}`;
                 processFrame();
                 lastFrameTime = timestamp;
             }
@@ -759,7 +757,13 @@
             lastAnchorTime = Date.now();
             eventLogs.push({ type: 'RESET_ORIGIN', time: new Date().toISOString() });
             
-            setTimeout(() => alert(`Origin Resetted. Re-calibrating IMU...`), 10);
+            setTimeout(() => {
+                const msg = document.createElement('div');
+                msg.innerText = "POSE & BIAS RESET";
+                msg.style.cssText = "position:absolute; top:20px; left:50%; transform:translateX(-50%); background:var(--primary); color:#000; padding:10px; border-radius:5px; z-index:1000;";
+                document.body.appendChild(msg);
+                setTimeout(() => msg.remove(), 2000);
+            }, 10);
         };
         document.getElementById('btn-toggle-menu').onclick = () => {
             const overlay = document.querySelector('.overlay');
