@@ -221,6 +221,7 @@
         
         // Calibration
         let biasX = 0, biasY = 0;
+        let biasGx = 0, biasGy = 0, biasGz = 9.8;
         let calibrationCount = 0;
         const CALIBRATION_LIMIT = 60; // ~1 second at 60Hz
 
@@ -290,90 +291,92 @@
 
             if (dt <= 0 || dt > 0.5) return;
 
-            const accel = event.acceleration; // Linear
-            const grav = event.accelerationIncludingGravity; // Gravity holder
+            const accel = event.acceleration; 
+            const grav = event.accelerationIncludingGravity;
             const rot = event.rotationRate;
 
-            if (!accel || accel.x === null || !grav || grav.x === null) return;
-
-            sensorStatus.innerText = "ACTIVE (3D)";
-            sensorStatus.style.color = "var(--primary)";
-
-            // 1. Get current Gravity Vector for tilt compensation
-            let gx = grav.x, gy = grav.y, gz = grav.z;
-            let gMag = Math.sqrt(gx*gx + gy*gy + gz*gz);
-            if (gMag < 1) return; // Invalid state
-            
-            // Normalize Gravity (pointing DOWN)
-            let nx = gx / gMag, ny = gy / gMag, nz = gz / gMag;
-
-            // 2. Calibration (Bias removal)
-            if (calibrationCount < CALIBRATION_LIMIT) {
-                biasX = (biasX * calibrationCount + accel.x) / (calibrationCount + 1);
-                biasY = (biasY * calibrationCount + accel.y) / (calibrationCount + 1);
-                calibrationCount++;
-                sensorStatus.innerText = `CALIBRATING ${Math.round(calibrationCount/CALIBRATION_LIMIT*100)}%`;
+            // Ensure we have at least one working sensor
+            if (!grav || grav.x === null) {
+                sensorStatus.innerText = "WAITING FOR SENSOR...";
                 return;
             }
 
-            // 3. Compensation
-            let ax = accel.x - biasX;
-            let ay = accel.y - biasY;
-            let az = accel.z; // Usually Z bias is small
+            // Stable Gravity estimation (Low-pass)
+            biasGx = (biasGx * 0.95) + (grav.x * 0.05);
+            biasGy = (biasGy * 0.95) + (grav.y * 0.05);
+            biasGz = (biasGz * 0.95) + (grav.z * 0.05);
 
-            // 4. Project 3D Acceleration onto the Ground Plane
-            // We want to remove the vertical jitter (component parallel to Gravity)
-            let dot = ax*nx + ay*ny + az*nz;
-            let hx = ax - dot*nx;
-            let hy = ay - dot*ny;
-            let hz = az - dot*nz;
+            // Manual Linear Accel Calculation (Fallback if event.acceleration is null)
+            let lax = (accel && accel.x !== null) ? accel.x : (grav.x - biasGx);
+            let lay = (accel && accel.y !== null) ? accel.y : (grav.y - biasGy);
+            let laz = (accel && accel.z !== null) ? accel.z : (grav.z - biasGz);
 
-            // 5. Define Forward direction (Top of phone projected to ground)
-            // Phone Top vector is (0, 1, 0)
-            let fDot = (0*nx + 1*ny + 0*nz); // Dot product of Top and Gravity
-            let fx = 0 - fDot*nx;
-            let fy = 1 - fDot*ny;
-            let fz = 0 - fDot*nz;
+            // Normalize Gravity Vector (Down direction)
+            let gMag = Math.sqrt(biasGx**2 + biasGy**2 + biasGz**2);
+            let nx = biasGx / gMag, ny = biasGy / gMag, nz = biasGz / gMag;
+
+            // Calibration (Quiet phase - fine tuning)
+            if (calibrationCount < CALIBRATION_LIMIT) {
+                calibrationCount++;
+                sensorStatus.innerText = `CALIBRATING ${Math.round(calibrationCount/CALIBRATION_LIMIT*100)}%`;
+                sensorStatus.style.color = "#ffcc00";
+                return;
+            }
+
+            sensorStatus.innerText = "ACTIVE";
+            sensorStatus.style.color = "var(--primary)";
+
+            // 1. Project 3D Acceleration to Horizontal Plane
+            let dot = lax*nx + lay*ny + laz*nz;
+            let hx = lax - dot*nx;
+            let hy = lay - dot*ny;
+            let hz = laz - dot*nz;
+
+            // 2. Define Directions
+            // Phone Top (0, 1, 0)
+            let fDot = ny; // (0,1,0) dot (nx, ny, nz)
+            let fx = 0 - fDot*nx, fy = 1 - fDot*ny, fz = 0 - fDot*nz;
             let fMag = Math.sqrt(fx*fx + fy*fy + fz*fz);
 
             let finalF = 0, finalR = 0;
-
-            if (fMag > 0.1) {
-                // Direction vectors
-                let ux = fx / fMag, uy = fy / fMag, uz = fz / fMag; // Forward Unit Vector
-                // Right Unit Vector (Cross product of Forward and Gravity)
-                let rx = uy*nz - uz*ny;
-                let ry = uz*nx - ux*nz;
-                let rz = ux*ny - uy*nx;
-
-                // 6. Project Horizontal Accel onto AGV Forward/Right axes
-                finalF = (hx*ux + hy*uy + hz*uz); // Forward Acceleration
-                finalR = (hx*rx + hy*ry + hz*rz); // Right Acceleration
+            if (fMag > 0.05) {
+                // Forward Unit
+                let ux = fx/fMag, uy = fy/fMag, uz = fz/fMag;
+                // Right Unit (Cross: Forward x Down)
+                let rx = uy*nz - uz*ny, ry = uz*nx - ux*nz, rz = ux*ny - uy*nx;
+                
+                finalF = hx*ux + hy*uy + hz*uz;
+                finalR = hx*rx + hy*ry + hz*rz;
+            } else {
+                // If phone is vertical (Top is Up), use Screen-Forward (Z)
+                finalF = laz; 
+                finalR = lax;
             }
 
-            // 7. Anti-Spin Suppression
-            if (rot && (Math.abs(rot.alpha) > 20 || Math.abs(rot.beta) > 20 || Math.abs(rot.gamma) > 20)) {
+            // 3. Rotation Suppression
+            if (rot && (Math.abs(rot.alpha) > 25 || Math.abs(rot.beta) > 25 || Math.abs(rot.gamma) > 25)) {
                 finalF = 0; finalR = 0;
-                velX *= 0.5; velY *= 0.5;
             }
 
-            // 8. Integration
-            const af = Math.abs(finalF) > ACCEL_DEADZONE ? finalF : 0;
-            const ar = Math.abs(finalR) > ACCEL_DEADZONE ? finalR : 0;
+            // 4. Integrate with Deadzone
+            const deadzone = 0.035;
+            const af = Math.abs(finalF) > deadzone ? finalF : 0;
+            const ar = Math.abs(finalR) > deadzone ? finalR : 0;
 
-            velY = (velY + af * dt) * VEL_DAMPING; // Y = Forward
-            velX = (velX + ar * dt) * VEL_DAMPING; // X = Right
+            const damping = 0.965; // Slightly less damping
+            velY = (velY + af * dt) * damping;
+            velX = (velX + ar * dt) * damping;
 
             curY += velY * dt;
             curX += velX * dt;
 
-            // Stop logic
+            // Brake logic
             if (af === 0 && ar === 0) {
-                if (Math.abs(velY) < 0.01) velY = 0;
-                if (Math.abs(velX) < 0.01) velX = 0;
+                if (Math.abs(velY) < 0.005) velY = 0;
+                if (Math.abs(velX) < 0.005) velX = 0;
             }
 
-            window.lastRawAccel = { x: finalR, y: finalF };
+            window.lastRawAccel = { x: finalR, y: finalF, lx: lax, ly: lay };
         }
 
         // Processing Logic
@@ -457,7 +460,8 @@
             // Update Coords UI at maximum frame rate
             let debugInfo = "";
             if (window.lastRawAccel) {
-                debugInfo = `<br><span style="font-size:10px; color:#888;">RAW ACCEL -> X: ${window.lastRawAccel.x.toFixed(2)}, Y: ${window.lastRawAccel.y.toFixed(2)}</span>`;
+                const la = ` | L-ACC -> X:${window.lastRawAccel.lx.toFixed(2)} Y:${window.lastRawAccel.ly.toFixed(2)}`;
+                debugInfo = `<br><span style="font-size:10px; color:#888;">PROJ -> X:${window.lastRawAccel.x.toFixed(2)}, Y:${window.lastRawAccel.y.toFixed(2)}${la}</span>`;
             }
 
             coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}${debugInfo}`;
