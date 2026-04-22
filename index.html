@@ -37,16 +37,33 @@
             bottom: 0;
             left: 0;
             right: 0;
-            height: 400px;
-            background: rgba(0, 0, 0, 0.75);
-            backdrop-filter: blur(10px);
-            padding: 20px;
+            max-height: 85vh;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(15px);
+            padding: 15px;
             color: #fff;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            border-top: 1px solid rgba(255, 255, 255, 0.2);
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 10px;
             box-sizing: border-box;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            overflow-y: auto;
+            z-index: 100;
+        }
+        .overlay.minimized {
+            transform: translateY(calc(100% - 110px));
+            overflow: hidden;
+        }
+        .btn-toggle-menu {
+            background: rgba(255,255,255,0.1);
+            padding: 8px;
+            font-size: 12px;
+            margin-bottom: 5px;
+            width: 100%;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #fff;
         }
 
         .status-row {
@@ -186,7 +203,8 @@
     <div id="bg-roi-guide"></div>
     <canvas id="proc-canvas" class="hidden"></canvas>
 
-    <div class="overlay">
+    <div class="overlay minimized">
+        <button class="btn-toggle-menu" id="btn-toggle-menu">▼ SHOW/HIDE MENU</button>
         <div class="status-row">
             <div>
                 <div class="status-label">Recording Status</div>
@@ -567,12 +585,12 @@
 
             if (lastVoPix && !isLoadedState && voQuality > 10) {
                 let bestY = 0, minSAD = Infinity;
-                for(let s=-15; s<=15; s++) {
+                for(let s=-10; s<=10; s+=1) {
                     let sad = 0, sampleCount = 0;
-                    for(let py=10; py<bh-10; py+=5) {
+                    for(let py=20; py<bh-20; py+=8) {
                         let pyShift = py + s;
                         if (pyShift < 0 || pyShift >= bh) continue;
-                        for(let px=10; px<bw-10; px+=10) {
+                        for(let px=40; px<bw-40; px+=25) {
                             sad += Math.abs(bgPix[py*bw + px] - lastVoPix[pyShift*bw + px]);
                             sampleCount++;
                         }
@@ -741,7 +759,14 @@
             lastAnchorTime = Date.now();
             eventLogs.push({ type: 'RESET_ORIGIN', time: new Date().toISOString() });
             
-            alert(`Origin Resetted. Re-calibrating IMU...`);
+            setTimeout(() => alert(`Origin Resetted. Re-calibrating IMU...`), 10);
+        };
+REPLACE WITH:
+        document.getElementById('btn-toggle-menu').onclick = () => {
+            const overlay = document.querySelector('.overlay');
+            overlay.classList.toggle('minimized');
+            document.getElementById('btn-toggle-menu').innerText = 
+                overlay.classList.contains('minimized') ? "▲ SHOW MENU" : "▼ HIDE MENU";
         };
 
         document.getElementById('btn-cal-start').onclick = () => {
@@ -834,7 +859,7 @@
                 let d = Math.sqrt((isNaN(dx)?0:dx)**2 + (isNaN(dy)?0:dy)**2);
                 return acc + d;
             }, 0);
-            alert(`Summary: ${loadedPeriods} Cycles | Total distance: ${totalDist.toFixed(2)}m`);
+            setTimeout(() => alert(`Summary: ${loadedPeriods} Cycles | Total distance: ${totalDist.toFixed(2)}m`), 10);
         };
 
         initCamera();
