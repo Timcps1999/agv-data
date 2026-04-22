@@ -141,15 +141,35 @@
             background: #6b4c9a;
         }
 
-        #roi-guide {
+        .trust-indicator {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-left: 10px;
+            border: 1px solid transparent;
+        }
+        .trust-good { background: #004422; color: #00ff88; border-color: #00ff88; }
+        .trust-degraded { background: #444400; color: #ffff00; border-color: #ffff00; }
+        .trust-untrustworthy { background: #440000; color: #ff4444; border-color: #ff4444; }
+        
+        .calib-pane {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            padding: 10px;
+            border-radius: 12px;
+            margin-top: 5px;
+            font-size: 13px;
+        }
+
+        #bg-roi-guide {
             position: absolute;
-            top: 30%;
-            left: 20%;
-            width: 60%;
-            height: 30%;
-            border: 2px dashed var(--primary);
+            top: 5%;
+            left: 10%;
+            width: 80%;
+            height: 20%;
+            border: 1px dashed rgba(0, 204, 255, 0.5);
             pointer-events: none;
-            box-sizing: border-box;
             z-index: 5;
         }
 
@@ -163,6 +183,7 @@
 
     <video id="video-preview" autoplay playsinline muted></video>
     <div id="roi-guide"></div>
+    <div id="bg-roi-guide"></div>
     <canvas id="proc-canvas" class="hidden"></canvas>
 
     <div class="overlay">
@@ -176,11 +197,30 @@
                 <div id="sensor-status" class="status-value" style="color: var(--danger); font-size: 14px;">OFF</div>
             </div>
         </div>
-        <button class="btn-origin" id="btn-set-origin" style="width: 100%; margin-top: 5px;">RESET ORIGIN (ZERO GYRO)</button>
+        <!-- IMU_FIX: Add SNAP TO ANCHOR button -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 5px;">
+            <button class="btn-origin" id="btn-set-origin">RESET ORIGIN</button>
+            <button class="btn-origin" id="btn-snap-anchor" style="background: #2a5298;">SNAP TO ANCHOR</button>
+        </div>
+
+        <div class="calib-pane">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 5px; color: #aaa;">
+                <span>SCALE: <span id="scale-val" style="color:var(--info)">--</span> m/px</span>
+                <span id="loc-status" style="font-size:10px;">VO: OFF</span>
+            </div>
+            <div style="display: flex; gap: 5px;">
+                <input type="number" id="cal-dist" value="2.0" step="0.1" style="width: 30%; height: 30px; background:#222; border:1px solid #444; color:#fff; border-radius:8px; padding-left:8px;">
+                <button id="btn-cal-start" style="padding: 5px; font-size: 12px; background: #333; flex:1; border-radius:8px; color:#fff;">START CAL</button>
+                <button id="btn-cal-end" style="padding: 5px; font-size: 12px; background: #333; flex:1; border-radius:8px; color:#fff;">END CAL</button>
+            </div>
+        </div>
 
         <div class="detection-card">
             <div class="status-label">Live Detection</div>
-            <div id="detection-result" class="detection-value">WAITING...</div>
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+                <div id="detection-result" class="detection-value">WAITING...</div>
+                <div id="trust-indicator" class="trust-indicator trust-untrustworthy">UNTRUSTWORTHY</div>
+            </div>
             <div id="coord-display" class="coords">X: 0.00, Y: 0.00</div>
         </div>
 
@@ -192,6 +232,10 @@
                 <option value="5000">Interval: 5s</option>
                 <option value="10000">Interval: 10s</option>
             </select>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; grid-column: span 2;">
+                <input type="number" id="start-x" value="0.0" step="0.1" placeholder="Start X (Offset)">
+                <input type="number" id="start-y" value="0.0" step="0.1" placeholder="Start Y (Offset)">
+            </div>
             <button class="btn-start" id="btn-start">START</button>
             <button class="btn-stop" id="btn-stop">STOP</button>
             <button class="btn-clear" id="btn-clear">CLEAR DATA</button>
@@ -218,27 +262,59 @@
         let curX = 0, curY = 0, velX = 0, velY = 0;
         let lastMotionTime = Date.now();
         let sensorActive = false;
+        let imuEnabled = false;
         
         // Calibration
-        let biasX = 0, biasY = 0;
         let biasGx = 0, biasGy = 0, biasGz = 9.8;
         let calibrationCount = 0;
         const CALIBRATION_LIMIT = 60; // ~1 second at 60Hz
+
+        // IMU_FIX: Add state variables for true bias and stillness
+        let biasAf = 0, biasAr = 0;
+        let calSumAf = 0, calSumAr = 0, calCountAccepted = 0;
+        let lastGoodDt = 1/60;
+        let stillCount = 0;
+        const STILL_COUNT_LIMIT = 12;
+        const ROT_STILL = 6;  // deg/s
+        const ACC_STILL = 0.03; // m/s^2
+        const biasLearnRate = 0.005;
+        const CAL_ACC_GATE = 0.08;
+        const MIN_ACCEPT = 20;
+        const VEL_STILL_GATE = 0.02;
+        const anchorEvents = [];
+
+        // Visual Odometry State
+        const BACKGROUND_ROI = { x: 0.1, y: 0.05, w: 0.8, h: 0.2 };
+        let pxToMeter = parseFloat(localStorage.getItem('agv_px_to_meter')) || 0.005;
+        let lastVoPix = null;
+        let voQuality = 0;
+        let lastAnchorTime = Date.now();
+        let isCalibratingVO = false;
+        let calPixAccum = 0;
+        let estimatedDist = 0;
+        
+        const ANCHOR_MAP = {
+            "START": { x: 0, y: 0 },
+            "A1": { x: 5.0, y: 0 },
+            "A2": { x: 10.0, y: 0 },
+            "B1": { x: 5.0, y: 5.0 }
+        };
 
         // Config
         const ROI_RECT = { x: 0.2, y: 0.3, w: 0.6, h: 0.3 };
         const PIXEL_DIFF_THRESHOLD = 35;
         const CHANGE_RATIO_THRESHOLD = 0.30;
-        const ACCEL_DEADZONE = 0.03; // Even more sensitive with bias removal
-        const VEL_DAMPING = 0.95; 
+        const ACCEL_DEADZONE = 0.035; 
+        const VEL_DAMPING = 0.965; 
 
         let lastAvgGray = -1;
+        let loadState = 'EMPTY'; // EMPTY, LOADING, LOADED, UNLOADING
+        let loadConfidence = 0;
+        let stateDwellFrames = 0;
         let isLoadedState = false;
         let currentStdDev = 0;
-
-        // Thresholds for Texture Detection
-        const SD_EMPTY_THRESHOLD = 18;
-        const SD_LOADED_THRESHOLD = 10;
+        let eventLogs = [];
+        const STATE_MIN_FRAMES = 12;
 
         // Start Camera
         async function initCamera() {
@@ -258,9 +334,16 @@
             }
         }
 
-        // Motion Tracking (Needs user gesture for iOS 13+)
-        function initMotion() {
+        // IMU_FIX: Improved Motion Permission with HTTPS Check and State Machine
+        async function initMotion() {
             if (sensorActive) return;
+
+            // HTTPS Check
+            if (window.location.protocol !== 'https:' && 
+                window.location.hostname !== 'localhost' && 
+                window.location.hostname !== '127.0.0.1') {
+                alert("Sensors may not work unless the page is served over HTTPS.");
+            }
 
             const handleMotionWrapper = (e) => {
                 handleMotion(e);
@@ -268,36 +351,60 @@
             };
 
             if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-                DeviceMotionEvent.requestPermission()
-                    .then(permissionState => {
-                        if (permissionState === 'granted') {
-                            window.addEventListener('devicemotion', handleMotionWrapper);
-                        } else {
-                            alert("Sensor Permission Denied.");
-                        }
-                    })
-                    .catch(e => {
-                        console.error("Motion Permission Error:", e);
-                    });
+                sensorStatus.innerText = "REQUESTING PERMISSION...";
+                try {
+                    const permissionState = await DeviceMotionEvent.requestPermission();
+                    if (permissionState === 'granted') {
+                        window.addEventListener('devicemotion', handleMotionWrapper);
+                        sensorStatus.innerText = "ACTIVE";
+                        sensorStatus.style.color = "var(--primary)";
+                        imuEnabled = true;
+                    } else {
+                        sensorStatus.innerText = "DENIED";
+                        sensorStatus.style.color = "var(--danger)";
+                        sensorActive = false; // Allow retry if user gesture happens again
+                        imuEnabled = false;
+                        eventLogs.push({ type: 'PERMISSION_DENIED', time: new Date().toISOString() });
+                    }
+                } catch (e) {
+                    console.error("Motion Permission Error:", e);
+                    sensorStatus.innerText = "ERROR";
+                    imuEnabled = false;
+                    eventLogs.push({ type: 'SENSOR_ERROR', time: new Date().toISOString() });
+                }
             } else {
+                // Fallback for browsers without requestPermission
                 window.addEventListener('devicemotion', handleMotionWrapper);
+                sensorStatus.innerText = "ACTIVE";
+                sensorStatus.style.color = "var(--primary)";
+                sensorActive = true;
+                imuEnabled = true;
             }
         }
 
+        // IMU_FIX: Refined Motion Processing with Stable DT, True Bias, Soft Rotation Suppression and ZUPT
         function handleMotion(event) {
-            const now = Date.now();
-            const dt = (now - lastMotionTime) / 1000;
-            lastMotionTime = now;
+            if (!imuEnabled) return;
+            // IMU_FIX: B) STABLE dt
+            let dt = lastGoodDt;
+            if (event.interval != null && event.interval > 0) {
+                dt = event.interval / 1000;
+            } else {
+                const now = Date.now();
+                dt = (now - lastMotionTime) / 1000;
+                lastMotionTime = now;
+            }
+            // Clamp and Validate DT
+            if (isNaN(dt) || dt < 0.005 || dt > 0.05) dt = lastGoodDt;
+            else lastGoodDt = dt;
 
-            if (dt <= 0 || dt > 0.5) return;
-
+            // IMU_FIX: E) Safer gravity / projection math - Handle Nulls
             const accel = event.acceleration; 
             const grav = event.accelerationIncludingGravity;
             const rot = event.rotationRate;
 
-            // Ensure we have at least one working sensor
             if (!grav || grav.x === null) {
-                sensorStatus.innerText = "WAITING FOR SENSOR...";
+                if (sensorStatus.innerText !== "DENIED") sensorStatus.innerText = "WAITING FOR SENSOR...";
                 return;
             }
 
@@ -306,25 +413,19 @@
             biasGy = (biasGy * 0.95) + (grav.y * 0.05);
             biasGz = (biasGz * 0.95) + (grav.z * 0.05);
 
-            // Manual Linear Accel Calculation (Fallback if event.acceleration is null)
             let lax = (accel && accel.x !== null) ? accel.x : (grav.x - biasGx);
             let lay = (accel && accel.y !== null) ? accel.y : (grav.y - biasGy);
             let laz = (accel && accel.z !== null) ? accel.z : (grav.z - biasGz);
 
-            // Normalize Gravity Vector (Down direction)
             let gMag = Math.sqrt(biasGx**2 + biasGy**2 + biasGz**2);
+            if (gMag < 1) return; // Guard against zero gravity magnitude
             let nx = biasGx / gMag, ny = biasGy / gMag, nz = biasGz / gMag;
 
-            // Calibration (Quiet phase - fine tuning)
-            if (calibrationCount < CALIBRATION_LIMIT) {
-                calibrationCount++;
-                sensorStatus.innerText = `CALIBRATING ${Math.round(calibrationCount/CALIBRATION_LIMIT*100)}%`;
-                sensorStatus.style.color = "#ffcc00";
-                return;
+            // IMU_FIX: Compute Rotation Magnitude
+            let rotMag = 0;
+            if (rot && rot.alpha !== null) {
+                rotMag = Math.sqrt(rot.alpha**2 + rot.beta**2 + rot.gamma**2);
             }
-
-            sensorStatus.innerText = "ACTIVE";
-            sensorStatus.style.color = "var(--primary)";
 
             // 1. Project 3D Acceleration to Horizontal Plane
             let dot = lax*nx + lay*ny + laz*nz;
@@ -333,53 +434,105 @@
             let hz = laz - dot*nz;
 
             // 2. Define Directions
-            // Phone Top (0, 1, 0)
-            let fDot = ny; // (0,1,0) dot (nx, ny, nz)
+            let fDot = ny; 
             let fx = 0 - fDot*nx, fy = 1 - fDot*ny, fz = 0 - fDot*nz;
             let fMag = Math.sqrt(fx*fx + fy*fy + fz*fz);
 
             let finalF = 0, finalR = 0;
             if (fMag > 0.05) {
-                // Forward Unit
                 let ux = fx/fMag, uy = fy/fMag, uz = fz/fMag;
-                // Right Unit (Cross: Forward x Down)
                 let rx = uy*nz - uz*ny, ry = uz*nx - ux*nz, rz = ux*ny - uy*nx;
-                
                 finalF = hx*ux + hy*uy + hz*uz;
                 finalR = hx*rx + hy*ry + hz*rz;
             } else {
-                // If phone is vertical (Top is Up), use Screen-Forward (Z)
                 finalF = laz; 
                 finalR = lax;
             }
 
-            // 3. Rotation Suppression
-            if (rot && (Math.abs(rot.alpha) > 25 || Math.abs(rot.beta) > 25 || Math.abs(rot.gamma) > 25)) {
-                finalF = 0; finalR = 0;
+            // IMU_FIX: A) TRUE CALIBRATION (bias estimation for horizontal accel)
+            if (calibrationCount < CALIBRATION_LIMIT) {
+                calibrationCount++;
+                sensorStatus.innerText = `CALIBRATING ${Math.round(calibrationCount/CALIBRATION_LIMIT*100)}%`;
+                sensorStatus.style.color = "#ffcc00";
+                
+                // Stillness gate for calibration
+                if (rotMag < ROT_STILL && Math.abs(finalF) < CAL_ACC_GATE && Math.abs(finalR) < CAL_ACC_GATE) {
+                    calSumAf += finalF;
+                    calSumAr += finalR;
+                    calCountAccepted++;
+                }
+                
+                if (calibrationCount === CALIBRATION_LIMIT) {
+                    if (calCountAccepted >= MIN_ACCEPT) {
+                        biasAf = calSumAf / calCountAccepted;
+                        biasAr = calSumAr / calCountAccepted;
+                        sensorStatus.innerText = "ACTIVE";
+                        sensorStatus.style.color = "var(--primary)";
+                    } else {
+                        biasAf = 0; biasAr = 0;
+                        sensorStatus.innerText = "CALIB WARN"; // Bias remains 0, but show warning
+                    }
+                }
+                return;
             }
 
-            // 4. Integrate with Deadzone
-            const deadzone = 0.035;
-            const af = Math.abs(finalF) > deadzone ? finalF : 0;
-            const ar = Math.abs(finalR) > deadzone ? finalR : 0;
+            // IMU_FIX: Apply Bias and C) SOFT rotation suppression
+            let correctedF = finalF - biasAf;
+            let correctedR = finalR - biasAr;
 
-            const damping = 0.965; // Slightly less damping
-            velY = (velY + af * dt) * damping;
-            velX = (velX + ar * dt) * damping;
+            const ROT_MAX = 120; // deg/s
+            let wRot = Math.max(0, Math.min(1, 1 - (rotMag / ROT_MAX)**2));
+            
+            // IMU_FIX: Apply Deadzone AFTER bias removal
+            let af = Math.abs(correctedF) > ACCEL_DEADZONE ? correctedF : 0;
+            let ar = Math.abs(correctedR) > ACCEL_DEADZONE ? correctedR : 0;
 
-            curY += velY * dt;
-            curX += velX * dt;
+            let weightedF = af * wRot;
+            let weightedR = ar * wRot;
 
-            // Brake logic
-            if (af === 0 && ar === 0) {
+            // IMU_FIX: D) ZUPT + Adaptive bias update
+            let isStill = (rotMag < ROT_STILL && Math.abs(weightedF) < ACC_STILL && Math.abs(weightedR) < ACC_STILL);
+            if (isStill) {
+                stillCount++;
+                if (stillCount >= STILL_COUNT_LIMIT && (Math.abs(velX) + Math.abs(velY)) < VEL_STILL_GATE) {
+                    // Zero Velocity Update
+                    velX *= 0.3; if (Math.abs(velX) < 0.001) velX = 0;
+                    velY *= 0.3; if (Math.abs(velY) < 0.001) velY = 0;
+                    // Slow bias adaptation
+                    biasAf = (1 - biasLearnRate) * biasAf + biasLearnRate * finalF;
+                    biasAr = (1 - biasLearnRate) * biasAr + biasLearnRate * finalR;
+                }
+            } else {
+                stillCount = 0;
+            }
+
+            // Integration with IMU Propagator
+            velY = (velY + weightedF * dt) * VEL_DAMPING;
+            velX = (velX + weightedR * dt) * VEL_DAMPING;
+            
+            // IMU serves as high-rate fill between VO updates
+            let imuDy = velY * dt;
+            let imuDx = velX * dt;
+            
+            // If VO is disabled (LOADED), IMU is sole source
+            if (isLoadedState || voQuality < 10) {
+                curY += imuDy;
+                curX += imuDx;
+            } else {
+                // Complementary: Smooth motion blend
+                curY += imuDy * 0.4; 
+                curX += imuDx * 0.4;
+            }
+
+            // Brake logic (Zero when very small)
+            if (weightedF === 0 && weightedR === 0) {
                 if (Math.abs(velY) < 0.005) velY = 0;
                 if (Math.abs(velX) < 0.005) velX = 0;
             }
 
-            window.lastRawAccel = { x: finalR, y: finalF, lx: lax, ly: lay };
+            window.lastImuData = { f: weightedF, r: weightedR, dt: dt, rot: rotMag };
         }
 
-        // Processing Logic
         function processFrame() {
             if (!video.videoWidth || video.paused) return;
 
@@ -394,6 +547,56 @@
             const w = ROI_RECT.w * canvas.width;
             const h = ROI_RECT.h * canvas.height;
 
+            // 1. Process Background ROI for Visual Odometry
+            let bx = Math.max(0, BACKGROUND_ROI.x * canvas.width);
+            let by = Math.max(0, BACKGROUND_ROI.y * canvas.height);
+            let bw = Math.min(canvas.width - bx, BACKGROUND_ROI.w * canvas.width);
+            let bh = Math.min(canvas.height - by, BACKGROUND_ROI.h * canvas.height);
+            bw = Math.floor(bw); bh = Math.floor(bh);
+            if (bw <= 0 || bh <= 0) return;
+            const bgData = ctx.getImageData(bx, by, bw, bh);
+            const bgPix = new Uint8Array(bw * bh);
+            let bgMean = 0;
+            for(let i=0; i<bgData.data.length; i+=4) {
+                let g = bgData.data[i]*0.3 + bgData.data[i+1]*0.59 + bgData.data[i+2]*0.11;
+                bgPix[i/4] = g; bgMean += g;
+            }
+            bgMean /= (bw*bh);
+            let bgVar = 0; for(let i=0; i<bgPix.length; i++) bgVar += (bgPix[i]-bgMean)**2;
+            voQuality = Math.sqrt(bgVar/(bw*bh));
+
+            if (lastVoPix && !isLoadedState && voQuality > 10) {
+                let bestY = 0, minSAD = Infinity;
+                for(let s=-15; s<=15; s++) {
+                    let sad = 0, sampleCount = 0;
+                    for(let py=10; py<bh-10; py+=5) {
+                        let pyShift = py + s;
+                        if (pyShift < 0 || pyShift >= bh) continue;
+                        for(let px=10; px<bw-10; px+=10) {
+                            sad += Math.abs(bgPix[py*bw + px] - lastVoPix[pyShift*bw + px]);
+                            sampleCount++;
+                        }
+                    }
+                    if(sampleCount > 0) {
+                        let normSad = sad / sampleCount;
+                        if(normSad < minSAD) { minSAD = normSad; bestY = s; }
+                    }
+                }
+                let dy = -bestY; // Invert for forward motion
+                if (Math.abs(dy) > 1) {
+                    if (isCalibratingVO) calPixAccum += Math.abs(dy);
+                    let voMetersY = dy * pxToMeter;
+                    curY += voMetersY * 0.6; // Complementary update
+                    estimatedDist += Math.abs(voMetersY);
+                }
+                document.getElementById('loc-status').innerText = `VO: ACTIVE (${voQuality.toFixed(0)})`;
+            } else {
+                const reason = isLoadedState ? 'DISABLED (LOADED)' : 'LOW QUALITY';
+                document.getElementById('loc-status').innerText = `VO: ${reason}`;
+            }
+            lastVoPix = bgPix;
+
+            // 2. Process Load ROI
             const imageData = ctx.getImageData(x, y, w, h);
             const pixels = imageData.data;
 
@@ -413,27 +616,48 @@
             const variance = (totalGraySq / pixelCount) - (currentAvgGray * currentAvgGray);
             currentStdDev = Math.sqrt(Math.max(0, variance));
 
-            // State Logic
-            if (currentStdDev < SD_LOADED_THRESHOLD) {
-                isLoadedState = true;
-            } else if (currentStdDev > SD_EMPTY_THRESHOLD) {
-                isLoadedState = false;
-            }
+            // Advanced Feature Extraction
+            let gradSum = 0;
+            for(let i=1; i<grayPixels.length; i++) gradSum += Math.abs(grayPixels[i] - grayPixels[i-1]);
+            const currentEdges = gradSum / pixelCount;
+            const stability = lastAvgGray === -1 ? 1 : Math.max(0, 1 - Math.abs(currentAvgGray - lastAvgGray)/20);
 
-            // Jump Detection
-            if (lastAvgGray !== -1) {
-                const jump = Math.abs(currentAvgGray - lastAvgGray);
-                if (jump > (255 * CHANGE_RATIO_THRESHOLD)) {
-                    isLoadedState = !isLoadedState;
+            // Multimodal Confidence Score
+            let sc = Math.max(0, 1 - currentStdDev / 30);
+            let ec = Math.max(0, 1 - currentEdges / 40);
+            loadConfidence = (sc * 0.5 + ec * 0.3 + stability * 0.2);
+
+            // State Machine Transitions
+            const prevState = loadState;
+            if (loadState === 'EMPTY') {
+                if (loadConfidence > 0.7) { loadState = 'LOADING'; stateDwellFrames = 0; }
+            } else if (loadState === 'LOADING') {
+                stateDwellFrames++;
+                if (loadConfidence < 0.4) loadState = 'EMPTY';
+                else if (stateDwellFrames > STATE_MIN_FRAMES) {
+                    loadState = 'LOADED';
+                    eventLogs.push({ type: 'LOAD_CONFIRMED', time: new Date().toISOString(), conf: loadConfidence.toFixed(2) });
+                }
+            } else if (loadState === 'LOADED') {
+                if (loadConfidence < 0.3) { loadState = 'UNLOADING'; stateDwellFrames = 0; }
+            } else if (loadState === 'UNLOADING') {
+                stateDwellFrames++;
+                if (loadConfidence > 0.6) loadState = 'LOADED';
+                else if (stateDwellFrames > STATE_MIN_FRAMES) {
+                    loadState = 'EMPTY';
+                    eventLogs.push({ type: 'UNLOAD_CONFIRMED', time: new Date().toISOString(), conf: loadConfidence.toFixed(2) });
                 }
             }
+            
+            if (prevState !== loadState && (loadState === 'LOADING' || loadState === 'UNLOADING')) {
+                eventLogs.push({ type: loadState === 'LOADING' ? 'LOAD_START' : 'UNLOAD_START', time: new Date().toISOString() });
+            }
+            isLoadedState = (loadState === 'LOADED' || loadState === 'UNLOADING');
 
-            // Update Prediction UI
-            const statusText = isLoadedState ? 'LOADED' : 'EMPTY';
-            detectionResult.innerText = statusText;
-            detectionResult.style.color = isLoadedState ? 'var(--primary)' : '#ffcc00';
+            const colors = { 'EMPTY': '#ffcc00', 'LOADING': '#00ccff', 'LOADED': 'var(--primary)', 'UNLOADING': '#ff4444' };
+            detectionResult.innerHTML = `${loadState} <span style="font-size:12px; color:#aaa">(${Math.round(loadConfidence*100)}%)</span>`;
+            detectionResult.style.color = colors[loadState] || '#fff';
 
-            // Logging
             if (isRecording) {
                 const now = Date.now();
                 const interval = parseInt(document.getElementById('interval-select').value);
@@ -455,18 +679,27 @@
             lastFrameData = grayPixels;
         }
 
-        // Main Loop for UI and High-Freq Updates
         function mainLoop(timestamp) {
-            // Update Coords UI at maximum frame rate
-            let debugInfo = "";
-            if (window.lastRawAccel) {
-                const la = ` | L-ACC -> X:${window.lastRawAccel.lx.toFixed(2)} Y:${window.lastRawAccel.ly.toFixed(2)}`;
-                debugInfo = `<br><span style="font-size:10px; color:#888;">PROJ -> X:${window.lastRawAccel.x.toFixed(2)}, Y:${window.lastRawAccel.y.toFixed(2)}${la}</span>`;
+            const indicator = document.getElementById('trust-indicator');
+            const age = (Date.now() - lastAnchorTime) / 1000;
+            
+            if (!imuEnabled) {
+                indicator.className = "trust-indicator trust-untrustworthy";
+                indicator.innerText = "NO SENSOR";
+            } else if (isLoadedState) {
+                indicator.className = age < 30 ? "trust-indicator trust-good" : "trust-indicator trust-degraded";
+                indicator.innerText = age < 30 ? "ANCHOR SYNC" : "IMU ONLY";
+            } else if (voQuality > 10) {
+                indicator.className = "trust-indicator trust-good";
+                indicator.innerText = "HYBRID VO";
+            } else {
+                indicator.className = "trust-indicator trust-degraded";
+                indicator.innerText = "DRIFT LIKELY";
             }
 
-            coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}${debugInfo}`;
+            document.getElementById('scale-val').innerText = pxToMeter.toFixed(5);
+            coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}`;
 
-            // Process detection at a fixed rate (approx 10 FPS) for visual feedback
             if (timestamp - lastFrameTime > 100) {
                 processFrame();
                 lastFrameTime = timestamp;
@@ -475,11 +708,10 @@
             requestAnimationFrame(mainLoop);
         }
 
-        // Controls
         document.getElementById('btn-start').onclick = () => {
             initMotion();
             isRecording = true;
-            lastLogTime = 0; // Trigger immediate first log
+            lastLogTime = 0;
             recordingStatus.innerText = "RECORDING";
             recordingStatus.style.color = "var(--primary)";
         };
@@ -490,11 +722,78 @@
             recordingStatus.style.color = "#fff";
         };
 
+        // IMU_FIX: F) RESET ORIGIN must reset IMU filters cleanly
         document.getElementById('btn-set-origin').onclick = () => {
-            curX = 0; curY = 0; velX = 0; velY = 0;
-            // Trigger re-calibration
-            biasX = 0; biasY = 0; calibrationCount = 0;
-            alert("Coordinates Reset & Re-calibrating Bias...");
+            const sx = parseFloat(document.getElementById('start-x').value) || 0;
+            const sy = parseFloat(document.getElementById('start-y').value) || 0;
+            curX = sx; curY = sy; velX = 0; velY = 0;
+            
+            // Reset filters and calibration
+            biasAf = 0; biasAr = 0;
+            lastGoodDt = 1/60;
+            stillCount = 0;
+            calibrationCount = 0;
+            calSumAf = 0; calSumAr = 0; calCountAccepted = 0;
+            biasGx = 0; biasGy = 0; biasGz = 9.8;
+            estimatedDist = 0;
+            voQuality = 0;
+            lastVoPix = null;
+            lastAnchorTime = Date.now();
+            eventLogs.push({ type: 'RESET_ORIGIN', time: new Date().toISOString() });
+            
+            alert(`Origin Resetted. Re-calibrating IMU...`);
+        };
+
+        document.getElementById('btn-cal-start').onclick = () => {
+            if (isLoadedState) return alert("Must calibrate while EMPTY!");
+            calPixAccum = 0;
+            isCalibratingVO = true;
+            document.getElementById('btn-cal-start').style.background = "var(--danger)";
+            alert("Move exactly the distance entered, then tap END CAL.");
+        };
+
+        document.getElementById('btn-cal-end').onclick = () => {
+            isCalibratingVO = false;
+            document.getElementById('btn-cal-start').style.background = "#333";
+            let dist = parseFloat(document.getElementById('cal-dist').value);
+            if (calPixAccum > 10 && dist > 0) {
+                pxToMeter = dist / calPixAccum;
+                localStorage.setItem('agv_px_to_meter', pxToMeter);
+                alert(`Calibrated: ${pxToMeter.toFixed(6)} m/px`);
+            } else {
+                alert("Insufficient motion detected.");
+            }
+        };
+
+        // IMU_FIX: G) SNAP TO ANCHOR implementation
+        document.getElementById('btn-snap-anchor').onclick = () => {
+            let keys = Object.keys(ANCHOR_MAP).join(', ');
+            let input = prompt(`Anchor ID (${keys}) or "X, Y"`);
+            if (!input) return;
+            
+            let targetX = 0, targetY = 0;
+            if (ANCHOR_MAP[input.toUpperCase()]) {
+                targetX = ANCHOR_MAP[input.toUpperCase()].x;
+                targetY = ANCHOR_MAP[input.toUpperCase()].y;
+            } else {
+                let parts = input.split(',').map(s => parseFloat(s.trim()));
+                if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+                    targetX = parts[0]; targetY = parts[1];
+                } else return alert("Invalid Input");
+            }
+
+            curX = targetX; curY = targetY;
+            velX = 0; velY = 0;
+            biasAf = 0; biasAr = 0;
+            lastGoodDt = 1/60;
+            stillCount = 0;
+            calibrationCount = 0;
+            calSumAf = 0; calSumAr = 0; calCountAccepted = 0;
+            biasGx = 0; biasGy = 0; biasGz = 9.8;
+            lastAnchorTime = Date.now();
+            anchorEvents.push({ timeISO: new Date().toISOString(), x: curX, y: curY });
+            eventLogs.push({ type: 'SNAP_TO_ANCHOR', time: new Date().toISOString(), context: input });
+            alert(`Snapped to ${curX}, ${curY}. Pose reset.`);
         };
 
         document.getElementById('btn-clear').onclick = () => {
@@ -502,19 +801,40 @@
             alert("Logs cleared");
         };
 
-        document.getElementById('btn-export').onclick = () => {
-            if (logs.length === 0) { alert("No data to export"); return; }
-            let csv = "timestamp_iso8601,agv_id,load_flag,avg_gray,std_dev,coord_x,coord_y\n";
-            logs.forEach(l => {
-                csv += `${l.time},${l.id},${l.status},${l.avg_gray},${l.std_dev},${l.x},${l.y}\n`;
-            });
-
-            const blob = new Blob([csv], { type: 'text/csv' });
+        const downloadCSV = (content, name) => {
+            const blob = new Blob([content], { type: 'text/csv' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url;
-            a.download = `agv_log_${Date.now()}.csv`;
+            a.href = url; a.download = `${name}_${Date.now()}.csv`;
             a.click();
+        };
+
+        document.getElementById('btn-export').onclick = () => {
+            if (logs.length === 0) return alert("No data to export");
+            
+            // 1. Primary Log
+            let csv = "timestamp_iso8601,agv_id,load_flag,avg_gray,std_dev,coord_x,coord_y\n";
+            logs.forEach(l => csv += `${l.time},${l.id},${l.status},${l.avg_gray},${l.std_dev},${l.x},${l.y}\n`);
+            downloadCSV(csv, 'agv_telemetry');
+
+            // 2. Event Log
+            let eCsv = "timestamp,event_type,context\n";
+            eventLogs.forEach(e => {
+                let context = e.context || e.conf || '';
+                eCsv += `${e.time},${e.type},"${context}"\n`;
+            });
+            downloadCSV(eCsv, 'agv_events');
+
+            // 3. Summary analysis
+            const loadedPeriods = eventLogs.filter(e => e.type === 'LOAD_CONFIRMED').length;
+            const totalDist = logs.reduce((acc, l, i, arr) => {
+                if (i === 0) return 0;
+                let dx = parseFloat(l.x) - parseFloat(arr[i-1].x);
+                let dy = parseFloat(l.y) - parseFloat(arr[i-1].y);
+                let d = Math.sqrt((isNaN(dx)?0:dx)**2 + (isNaN(dy)?0:dy)**2);
+                return acc + d;
+            }, 0);
+            alert(`Summary: ${loadedPeriods} Cycles | Total distance: ${totalDist.toFixed(2)}m`);
         };
 
         initCamera();
