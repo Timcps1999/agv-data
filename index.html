@@ -278,6 +278,7 @@
 
         // Coords Tracking
         let curX = 0, curY = 0, velX = 0, velY = 0;
+        let worldYaw = 0; // Gyro heading
         let lastMotionTime = Date.now();
         let sensorActive = false;
         let imuEnabled = false;
@@ -523,23 +524,32 @@
                 stillCount = 0;
             }
 
+            // IMU_FIX: G) Gyro Heading Tracking
+            // Use gravity vector to identify vertical axis (Yaw axis)
+            let yawRate = 0;
+            if (rot && rot.alpha !== null) {
+                // If phone is flat (nz is large), alpha is yaw.
+                // If phone is upright (ny is large), beta/gamma is yaw.
+                // Heuristic: Weighted blend of gyro based on orientation
+                yawRate = (rot.alpha * Math.abs(nz) + rot.beta * Math.abs(ny) + rot.gamma * Math.abs(nx)) / gMag;
+            }
+            worldYaw += (yawRate * (Math.PI / 180) * dt); // To Radians
+
             // Integration with IMU Propagator
             velY = (velY + weightedF * dt) * VEL_DAMPING;
             velX = (velX + weightedR * dt) * VEL_DAMPING;
             
-            // IMU serves as high-rate fill between VO updates
-            let imuDy = velY * dt;
-            let imuDx = velX * dt;
+            // Transform Local Motion to World Space
+            let cosY = Math.cos(worldYaw);
+            let sinY = Math.sin(worldYaw);
             
-            // If VO is disabled (LOADED), IMU is sole source
-            if (isLoadedState || voQuality < 10) {
-                curY += imuDy;
-                curX += imuDx;
-            } else {
-                // Complementary: Smooth motion blend
-                curY += imuDy * 0.4; 
-                curX += imuDx * 0.4;
-            }
+            // IMU serves as high-rate fill
+            // World X is "Right", World Y is "Forward"
+            let worldDy = (velY * cosY - velX * sinY) * dt;
+            let worldDx = (velY * sinY + velX * cosY) * dt;
+            
+            curY += worldDy;
+            curX += worldDx;
 
             // Brake logic (Zero when very small)
             if (weightedF === 0 && weightedR === 0) {
@@ -547,7 +557,7 @@
                 if (Math.abs(velX) < 0.005) velX = 0;
             }
 
-            window.lastImuData = { f: weightedF, r: weightedR, dt: dt, rot: rotMag };
+            window.lastImuData = { f: weightedF, r: weightedR, dt: dt, yaw: worldYaw };
         }
 
         function processFrame() {
@@ -599,11 +609,15 @@
                         if(normSad < minSAD) { minSAD = normSad; bestY = s; }
                     }
                 }
-                let dy = -bestY; // Invert for forward motion
+                let dy = -bestY; 
                 if (Math.abs(dy) > 1) {
                     if (isCalibratingVO) calPixAccum += Math.abs(dy);
                     let voMetersY = dy * pxToMeter;
-                    curY += voMetersY * 0.6; // Complementary update
+                    
+                    // Correct current velocity based on visual observation
+                    let voVelY = voMetersY / 0.1; // 10Hz = 0.1s
+                    velY = velY * 0.7 + voVelY * 0.3; // Velocity-level fusion
+                    
                     estimatedDist += Math.abs(voMetersY);
                 }
                 document.getElementById('loc-status').innerText = `VO: ACTIVE (${voQuality.toFixed(0)})`;
@@ -715,8 +729,8 @@
             }
 
             if (timestamp - lastFrameTime > 100) {
-                document.getElementById('scale-val').innerText = pxToMeter.toFixed(5);
-                coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | SD: ${currentStdDev.toFixed(1)}`;
+                const headDeg = (worldYaw * 180 / Math.PI).toFixed(0);
+                coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | HDG: ${headDeg}° | SD: ${currentStdDev.toFixed(1)}`;
                 processFrame();
                 lastFrameTime = timestamp;
             }
@@ -743,6 +757,7 @@
             const sx = parseFloat(document.getElementById('start-x').value) || 0;
             const sy = parseFloat(document.getElementById('start-y').value) || 0;
             curX = sx; curY = sy; velX = 0; velY = 0;
+            worldYaw = 0; // Reset gyro heading
             
             // Reset filters and calibration
             biasAf = 0; biasAr = 0;
