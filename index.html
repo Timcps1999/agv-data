@@ -203,8 +203,8 @@
     <div id="bg-roi-guide"></div>
     <canvas id="proc-canvas" class="hidden"></canvas>
 
-    <div class="overlay minimized">
-        <button class="btn-toggle-menu" id="btn-toggle-menu">▼ SHOW/HIDE MENU</button>
+    <div class="overlay">
+        <button class="btn-toggle-menu" id="btn-toggle-menu">▼ HIDE MENU</button>
         <div class="status-row">
             <div>
                 <div class="status-label">Recording Status</div>
@@ -761,7 +761,6 @@
             
             setTimeout(() => alert(`Origin Resetted. Re-calibrating IMU...`), 10);
         };
-REPLACE WITH:
         document.getElementById('btn-toggle-menu').onclick = () => {
             const overlay = document.querySelector('.overlay');
             overlay.classList.toggle('minimized');
