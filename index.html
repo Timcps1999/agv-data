@@ -436,6 +436,12 @@
                 return;
             }
 
+            // IMU_FIX: Compute Rotation Magnitude early
+            let rotMag = 0;
+            if (rot && rot.alpha !== null) {
+                rotMag = Math.sqrt(rot.alpha**2 + rot.beta**2 + rot.gamma**2);
+            }
+
             // Stable Gravity estimation (Low-pass) - ONLY when not turning sharply
             if (rotMag < 10) {
                 biasGx = (biasGx * 0.98) + (grav.x * 0.02);
@@ -450,12 +456,6 @@
             let gMag = Math.sqrt(biasGx**2 + biasGy**2 + biasGz**2);
             if (gMag < 1) return; // Guard against zero gravity magnitude
             let nx = biasGx / gMag, ny = biasGy / gMag, nz = biasGz / gMag;
-
-            // IMU_FIX: Compute Rotation Magnitude
-            let rotMag = 0;
-            if (rot && rot.alpha !== null) {
-                rotMag = Math.sqrt(rot.alpha**2 + rot.beta**2 + rot.gamma**2);
-            }
 
             // 1. Project 3D Acceleration to Horizontal Plane
             let dot = lax*nx + lay*ny + laz*nz;
@@ -475,7 +475,7 @@
                 finalF = hx*ux + hy*uy + hz*uz;
                 finalR = hx*rx + hy*ry + hz*rz;
             } else {
-                finalF = laz; 
+                finalF = -laz; 
                 finalR = lax;
             }
 
@@ -512,20 +512,14 @@
             const ROT_MAX = 120; // deg/s
             let wRot = Math.max(0, Math.min(1, 1 - (rotMag / ROT_MAX)**2));
             
-            // IMU_FIX: Apply Deadzone AFTER bias removal
-            let af = Math.abs(correctedF) > ACCEL_DEADZONE ? correctedF : 0;
-            let ar = Math.abs(correctedR) > ACCEL_DEADZONE ? correctedR : 0;
-
-            let weightedF = af * wRot;
-            let weightedR = ar * wRot;
-
             // IMU_FIX: D) ZUPT + Adaptive bias update
-            let isStill = (rotMag < ROT_STILL && Math.abs(af) < ACC_STILL && Math.abs(ar) < ACC_STILL);
+            let isStill = (rotMag < ROT_STILL && Math.abs(correctedF) < ACC_STILL && Math.abs(correctedR) < ACC_STILL);
             if (isStill) {
                 stillCount++;
-                if (stillCount >= STILL_COUNT_LIMIT) {
-                    // Force velocity to zero to kill drift
-                    velX = 0; velY = 0;
+                if (stillCount >= STILL_COUNT_LIMIT && (Math.abs(velX) + Math.abs(velY)) < VEL_STILL_GATE) {
+                    // Force velocity to zero ONLY if it's already creeping slowly (drift)
+                    velX *= 0.5; if (Math.abs(velX) < 0.001) velX = 0;
+                    velY *= 0.5; if (Math.abs(velY) < 0.001) velY = 0;
                     // Slow bias adaptation
                     biasAf = (1 - biasLearnRate) * biasAf + biasLearnRate * finalF;
                     biasAr = (1 - biasLearnRate) * biasAr + biasLearnRate * finalR;
@@ -533,6 +527,13 @@
             } else {
                 stillCount = 0;
             }
+
+            // Apply Deadzone
+            let af = Math.abs(correctedF) > ACCEL_DEADZONE ? correctedF : 0;
+            let ar = Math.abs(correctedR) > ACCEL_DEADZONE ? correctedR : 0;
+
+            let weightedF = af * wRot;
+            let weightedR = ar * wRot;
 
             // World Yaw is now updated by DeviceOrientation event for stability
             // If event failed, fallback to gyro integration
@@ -542,8 +543,10 @@
             }
 
             // Integration with IMU Propagator
-            velY = (velY + weightedF * dt) * VEL_DAMPING;
-            velX = (velX + weightedR * dt) * VEL_DAMPING;
+            // Less damping if vehicle is moving, allowing it to coast at constant speed realistically
+            let currentDamping = (!isStill) ? 0.99 : VEL_DAMPING;
+            velY = (velY + weightedF * dt) * currentDamping;
+            velX = (velX + weightedR * dt) * currentDamping;
             
             // Transform Local Motion to World Space
             let cosY = Math.cos(worldYaw);
@@ -566,7 +569,7 @@
             window.lastImuData = { f: weightedF, r: weightedR, dt: dt, yaw: worldYaw };
         }
 
-        function processFrame() {
+        function processFrame(voDt = 0.1) {
             if (!video.videoWidth || video.paused) return;
 
             if (canvas.width !== video.videoWidth) {
@@ -598,7 +601,8 @@
             let bgVar = 0; for(let i=0; i<bgPix.length; i++) bgVar += (bgPix[i]-bgMean)**2;
             voQuality = Math.sqrt(bgVar/(bw*bh));
 
-            if (lastVoPix && !isLoadedState && voQuality > 10) {
+            // VO works independently of load status because BACKGROUND_ROI only sees the environment
+            if (lastVoPix && voQuality > 10) {
                 let bestY = 0, minSAD = Infinity;
                 for(let s=-10; s<=10; s+=1) {
                     let sad = 0, sampleCount = 0;
@@ -620,16 +624,15 @@
                     if (isCalibratingVO) calPixAccum += Math.abs(dy);
                     let voMetersY = dy * pxToMeter;
                     
-                    // Correct current velocity based on visual observation
-                    let voVelY = voMetersY / 0.1; // 10Hz = 0.1s
-                    velY = velY * 0.7 + voVelY * 0.3; // Velocity-level fusion
+                    // Correct current velocity based on visual observation with accurate DT
+                    let voVelY = voMetersY / voDt;
+                    velY = velY * 0.5 + voVelY * 0.5; // Velocity-level fusion
                     
                     estimatedDist += Math.abs(voMetersY);
                 }
                 document.getElementById('loc-status').innerText = `VO: ACTIVE (${voQuality.toFixed(0)})`;
             } else {
-                const reason = isLoadedState ? 'DISABLED (LOADED)' : 'LOW QUALITY';
-                document.getElementById('loc-status').innerText = `VO: ${reason}`;
+                document.getElementById('loc-status').innerText = `VO: LOW QUAL (${voQuality.toFixed(0)})`;
             }
             lastVoPix = bgPix;
 
@@ -737,7 +740,11 @@
             if (timestamp - lastFrameTime > 100) {
                 const headDeg = (worldYaw * 180 / Math.PI).toFixed(0);
                 coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | HDG: ${headDeg}° | SD: ${currentStdDev.toFixed(1)}`;
-                processFrame();
+                
+                let voDt = (timestamp - lastFrameTime) / 1000;
+                if (lastFrameTime === 0 || isNaN(voDt)) voDt = 0.1;
+                processFrame(voDt);
+                
                 lastFrameTime = timestamp;
             }
 
