@@ -544,8 +544,10 @@
             }
 
             // Integration with IMU Propagator
-            // Less damping if vehicle is moving, allowing it to coast at constant speed realistically
-            let currentDamping = (!isStill) ? 0.99 : VEL_DAMPING;
+            // If VO is actively anchoring speed, completely disable damping (1.0) to preserve total distance integral (prevents Return-to-Origin drift).
+            // If blind (only IMU), apply light 0.99 drag to prevent runaway drift.
+            let isVoActive = (typeof voQuality !== 'undefined' && voQuality > 10);
+            let currentDamping = (!isStill) ? (isVoActive ? 1.0 : 0.99) : VEL_DAMPING;
             velY = (velY + weightedF * dt) * currentDamping;
             velX = (velX + weightedR * dt) * 0.90; // Pseudo non-holonomic constraint (dampen lateral drift)
             
@@ -605,6 +607,7 @@
             // VO works independently of load status because BACKGROUND_ROI only sees the environment
             if (lastVoPix && voQuality > 10) {
                 let bestY = 0, minSAD = Infinity;
+                let sads = new Array(61);
                 // Expanded search area to capture faster cart movement (up to ~1.5m/s at 10Hz)
                 for(let s=-30; s<=30; s+=1) {
                     let sad = 0, sampleCount = 0;
@@ -618,11 +621,30 @@
                     }
                     if(sampleCount > 0) {
                         let normSad = sad / sampleCount;
+                        sads[s + 30] = normSad;
                         if(normSad < minSAD) { minSAD = normSad; bestY = s; }
+                    } else {
+                        sads[s + 30] = Infinity;
                     }
                 }
-                let dy = -bestY; 
-                if (dy !== 0) { // Removed dead-zone dropping slow sub-pixel level integration
+                
+                // Sub-pixel paraboloid interpolation to eliminate Return-to-Origin quantization drift
+                let subOffset = 0;
+                let bestIdx = bestY + 30;
+                if (bestIdx > 0 && bestIdx < 60) {
+                    let left = sads[bestIdx - 1];
+                    let center = sads[bestIdx];
+                    let right = sads[bestIdx + 1];
+                    if (left !== Infinity && right !== Infinity) {
+                        let denom = 2 * (left - 2 * center + right);
+                        if (Math.abs(denom) > 0.0001) {
+                            subOffset = (left - right) / denom;
+                        }
+                    }
+                }
+
+                let dy = -(bestY + subOffset); 
+                if (Math.abs(dy) > 0.01) { // Removed dead-zone dropping slow sub-pixel level integration
                     if (isCalibratingVO) calPixAccum += Math.abs(dy);
                     let voMetersY = dy * pxToMeter;
                     
