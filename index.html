@@ -278,7 +278,8 @@
 
         // Coords Tracking
         let curX = 0, curY = 0, velX = 0, velY = 0;
-        let worldYaw = 0; // Gyro heading
+        let worldYaw = 0; // Current Heading (Rads)
+        let initialYaw = null; // Heading Offset
         let lastMotionTime = Date.now();
         let sensorActive = false;
         let imuEnabled = false;
@@ -362,11 +363,17 @@
                 window.location.hostname !== 'localhost' && 
                 window.location.hostname !== '127.0.0.1') {
                 alert("Sensors may not work unless the page is served over HTTPS.");
-            }
-
-            const handleMotionWrapper = (e) => {
+            }            const handleMotionWrapper = (e) => {
                 handleMotion(e);
                 sensorActive = true;
+            };
+            const handleOrientWrapper = (e) => {
+                if (e.alpha !== null) {
+                    let rawAlpha = e.webkitCompassHeading || (360 - e.alpha);
+                    let rads = rawAlpha * (Math.PI / 180);
+                    if (initialYaw === null) initialYaw = rads;
+                    worldYaw = rads - initialYaw;
+                }
             };
 
             if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
@@ -374,26 +381,28 @@
                 try {
                     const permissionState = await DeviceMotionEvent.requestPermission();
                     if (permissionState === 'granted') {
+                        if (DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                            await DeviceOrientationEvent.requestPermission();
+                        }
                         window.addEventListener('devicemotion', handleMotionWrapper);
+                        window.addEventListener('deviceorientation', handleOrientWrapper);
                         sensorStatus.innerText = "ACTIVE";
                         sensorStatus.style.color = "var(--primary)";
                         imuEnabled = true;
                     } else {
                         sensorStatus.innerText = "DENIED";
                         sensorStatus.style.color = "var(--danger)";
-                        sensorActive = false; // Allow retry if user gesture happens again
+                        sensorActive = false;
                         imuEnabled = false;
-                        eventLogs.push({ type: 'PERMISSION_DENIED', time: new Date().toISOString() });
                     }
                 } catch (e) {
-                    console.error("Motion Permission Error:", e);
+                    console.error("Permission Error:", e);
                     sensorStatus.innerText = "ERROR";
                     imuEnabled = false;
-                    eventLogs.push({ type: 'SENSOR_ERROR', time: new Date().toISOString() });
                 }
             } else {
-                // Fallback for browsers without requestPermission
                 window.addEventListener('devicemotion', handleMotionWrapper);
+                window.addEventListener('deviceorientation', handleOrientWrapper);
                 sensorStatus.innerText = "ACTIVE";
                 sensorStatus.style.color = "var(--primary)";
                 sensorActive = true;
@@ -427,10 +436,12 @@
                 return;
             }
 
-            // Stable Gravity estimation (Low-pass)
-            biasGx = (biasGx * 0.95) + (grav.x * 0.05);
-            biasGy = (biasGy * 0.95) + (grav.y * 0.05);
-            biasGz = (biasGz * 0.95) + (grav.z * 0.05);
+            // Stable Gravity estimation (Low-pass) - ONLY when not turning sharply
+            if (rotMag < 10) {
+                biasGx = (biasGx * 0.98) + (grav.x * 0.02);
+                biasGy = (biasGy * 0.98) + (grav.y * 0.02);
+                biasGz = (biasGz * 0.98) + (grav.z * 0.02);
+            }
 
             let lax = (accel && accel.x !== null) ? accel.x : (grav.x - biasGx);
             let lay = (accel && accel.y !== null) ? accel.y : (grav.y - biasGy);
@@ -509,13 +520,12 @@
             let weightedR = ar * wRot;
 
             // IMU_FIX: D) ZUPT + Adaptive bias update
-            let isStill = (rotMag < ROT_STILL && Math.abs(weightedF) < ACC_STILL && Math.abs(weightedR) < ACC_STILL);
+            let isStill = (rotMag < ROT_STILL && Math.abs(af) < ACC_STILL && Math.abs(ar) < ACC_STILL);
             if (isStill) {
                 stillCount++;
-                if (stillCount >= STILL_COUNT_LIMIT && (Math.abs(velX) + Math.abs(velY)) < VEL_STILL_GATE) {
-                    // Zero Velocity Update
-                    velX *= 0.3; if (Math.abs(velX) < 0.001) velX = 0;
-                    velY *= 0.3; if (Math.abs(velY) < 0.001) velY = 0;
+                if (stillCount >= STILL_COUNT_LIMIT) {
+                    // Force velocity to zero to kill drift
+                    velX = 0; velY = 0;
                     // Slow bias adaptation
                     biasAf = (1 - biasLearnRate) * biasAf + biasLearnRate * finalF;
                     biasAr = (1 - biasLearnRate) * biasAr + biasLearnRate * finalR;
@@ -524,16 +534,12 @@
                 stillCount = 0;
             }
 
-            // IMU_FIX: G) Gyro Heading Tracking
-            // Use gravity vector to identify vertical axis (Yaw axis)
-            let yawRate = 0;
-            if (rot && rot.alpha !== null) {
-                // If phone is flat (nz is large), alpha is yaw.
-                // If phone is upright (ny is large), beta/gamma is yaw.
-                // Heuristic: Weighted blend of gyro based on orientation
-                yawRate = (rot.alpha * Math.abs(nz) + rot.beta * Math.abs(ny) + rot.gamma * Math.abs(nx)) / gMag;
+            // World Yaw is now updated by DeviceOrientation event for stability
+            // If event failed, fallback to gyro integration
+            if (initialYaw === null && rot && rot.alpha !== null) {
+                let yawRate = (rot.alpha * Math.abs(nz) + rot.beta * Math.abs(ny) + rot.gamma * Math.abs(nx)) / gMag;
+                worldYaw += (yawRate * (Math.PI / 180) * dt);
             }
-            worldYaw += (yawRate * (Math.PI / 180) * dt); // To Radians
 
             // Integration with IMU Propagator
             velY = (velY + weightedF * dt) * VEL_DAMPING;
@@ -757,7 +763,7 @@
             const sx = parseFloat(document.getElementById('start-x').value) || 0;
             const sy = parseFloat(document.getElementById('start-y').value) || 0;
             curX = sx; curY = sy; velX = 0; velY = 0;
-            worldYaw = 0; // Reset gyro heading
+            worldYaw = 0; initialYaw = null; // Reset heading offset
             
             // Reset filters and calibration
             biasAf = 0; biasAr = 0;
