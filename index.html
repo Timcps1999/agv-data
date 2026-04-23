@@ -538,7 +538,8 @@
             // World Yaw is now updated by DeviceOrientation event for stability
             // If event failed, fallback to gyro integration
             if (initialYaw == null && rot && rot.alpha != null) {
-                let yawRate = (rot.alpha * Math.abs(nz) + rot.beta * Math.abs(ny) + rot.gamma * Math.abs(nx)) / gMag;
+                // FIXED: 'gamma' represents yaw rotation when phone is upright (ny ~ 1)
+                let yawRate = (rot.alpha * Math.abs(nz) + rot.gamma * Math.abs(ny) + rot.beta * Math.abs(nx)) / gMag;
                 worldYaw += (yawRate * (Math.PI / 180) * dt);
             }
 
@@ -546,7 +547,7 @@
             // Less damping if vehicle is moving, allowing it to coast at constant speed realistically
             let currentDamping = (!isStill) ? 0.99 : VEL_DAMPING;
             velY = (velY + weightedF * dt) * currentDamping;
-            velX = (velX + weightedR * dt) * currentDamping;
+            velX = (velX + weightedR * dt) * 0.90; // Pseudo non-holonomic constraint (dampen lateral drift)
             
             // Transform Local Motion to World Space
             let cosY = Math.cos(worldYaw);
@@ -604,12 +605,13 @@
             // VO works independently of load status because BACKGROUND_ROI only sees the environment
             if (lastVoPix && voQuality > 10) {
                 let bestY = 0, minSAD = Infinity;
-                for(let s=-10; s<=10; s+=1) {
+                // Expanded search area to capture faster cart movement (up to ~1.5m/s at 10Hz)
+                for(let s=-30; s<=30; s+=1) {
                     let sad = 0, sampleCount = 0;
-                    for(let py=20; py<bh-20; py+=8) {
+                    for(let py=20; py<bh-20; py+=10) { // Sparse sampling for performance
                         let pyShift = py + s;
                         if (pyShift < 0 || pyShift >= bh) continue;
-                        for(let px=40; px<bw-40; px+=25) {
+                        for(let px=40; px<bw-40; px+=30) {
                             sad += Math.abs(bgPix[py*bw + px] - lastVoPix[pyShift*bw + px]);
                             sampleCount++;
                         }
@@ -620,13 +622,13 @@
                     }
                 }
                 let dy = -bestY; 
-                if (Math.abs(dy) > 1) {
+                if (dy !== 0) { // Removed dead-zone dropping slow sub-pixel level integration
                     if (isCalibratingVO) calPixAccum += Math.abs(dy);
                     let voMetersY = dy * pxToMeter;
                     
-                    // Correct current velocity based on visual observation with accurate DT
+                    // Heavily anchor velocity to VO prediction since IMU double-integration is drift-prone
                     let voVelY = voMetersY / voDt;
-                    velY = velY * 0.5 + voVelY * 0.5; // Velocity-level fusion
+                    velY = velY * 0.3 + voVelY * 0.7; // 70% VO trust
                     
                     estimatedDist += Math.abs(voMetersY);
                 }
