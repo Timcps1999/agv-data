@@ -368,7 +368,7 @@
                 sensorActive = true;
             };
             const handleOrientWrapper = (e) => {
-                if (e.alpha !== null) {
+                if (e.alpha != null) {
                     let rawAlpha = e.webkitCompassHeading || (360 - e.alpha);
                     let rads = rawAlpha * (Math.PI / 180);
                     if (initialYaw === null) initialYaw = rads;
@@ -431,14 +431,14 @@
             const grav = event.accelerationIncludingGravity;
             const rot = event.rotationRate;
 
-            if (!grav || grav.x === null) {
+            if (!grav || grav.x == null) {
                 if (sensorStatus.innerText !== "DENIED") sensorStatus.innerText = "WAITING FOR SENSOR...";
                 return;
             }
 
             // IMU_FIX: Compute Rotation Magnitude early
             let rotMag = 0;
-            if (rot && rot.alpha !== null) {
+            if (rot && rot.alpha != null) {
                 rotMag = Math.sqrt(rot.alpha**2 + rot.beta**2 + rot.gamma**2);
             }
 
@@ -449,9 +449,9 @@
                 biasGz = (biasGz * 0.98) + (grav.z * 0.02);
             }
 
-            let lax = (accel && accel.x !== null) ? accel.x : (grav.x - biasGx);
-            let lay = (accel && accel.y !== null) ? accel.y : (grav.y - biasGy);
-            let laz = (accel && accel.z !== null) ? accel.z : (grav.z - biasGz);
+            let lax = (accel && accel.x != null) ? accel.x : (grav.x - biasGx);
+            let lay = (accel && accel.y != null) ? accel.y : (grav.y - biasGy);
+            let laz = (accel && accel.z != null) ? accel.z : (grav.z - biasGz);
 
             let gMag = Math.sqrt(biasGx**2 + biasGy**2 + biasGz**2);
             if (gMag < 1) return; // Guard against zero gravity magnitude
@@ -537,7 +537,7 @@
 
             // World Yaw is now updated by DeviceOrientation event for stability
             // If event failed, fallback to gyro integration
-            if (initialYaw === null && rot && rot.alpha !== null) {
+            if (initialYaw == null && rot && rot.alpha != null) {
                 let yawRate = (rot.alpha * Math.abs(nz) + rot.beta * Math.abs(ny) + rot.gamma * Math.abs(nx)) / gMag;
                 worldYaw += (yawRate * (Math.PI / 180) * dt);
             }
@@ -742,7 +742,7 @@
                 coordDisplay.innerHTML = `X: ${curX.toFixed(2)}, Y: ${curY.toFixed(2)} | HDG: ${headDeg}° | SD: ${currentStdDev.toFixed(1)}`;
                 
                 let voDt = (timestamp - lastFrameTime) / 1000;
-                if (lastFrameTime === 0 || isNaN(voDt)) voDt = 0.1;
+                if (voDt <= 0 || isNaN(voDt)) voDt = 0.1;
                 processFrame(voDt);
                 
                 lastFrameTime = timestamp;
